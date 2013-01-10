@@ -11,44 +11,60 @@ parser.add_option('-f', '--file', action='store', dest='file', help="File to par
 parser.add_option('-t', '--tree', action='store_true', dest='tree', help="Use tree viewer instead of printing")
 parser.add_option('-x', '--threshold', action='store', dest='threshold', type='int', default=0, help="Minimum value of sort field to allow in tree")
 parser.add_option('-r', '--reverse', action='store_true', dest='reverse', help="Order sort field highest to lowest")
-parser.add_option('-s', '--sort', action='store', dest='field', default='views', help="Sort field to use (views, unique, time, avg_time)")
+parser.add_option('-s', '--sort', action='store', dest='field', default='views', help="Sort field to use (views, unique, percentage, time, avg_time)")
 parser.add_option('-i', '--search', action='store', dest='search', help="Include only urls that match the given regular expression")
 parser.add_option('-c', '--children', action='store', dest='children', type='int', help="Include only top x children for each node")
 (options, args) = parser.parse_args()
 
+class DataStore(defaultdict):
+    def merge(self, other):
+        for key in other:
+            if other[key] == 0:
+                continue
+            if key == 'avg_time':
+                self.add_avg(other, 'avg_time', 'views')
+            elif key == 'avg_load':
+                self.add_avg(other, 'avg_load', 'load_sample')
+            else:
+                self.add(other, key)
+
+    def add(self, other, key):
+        self[key] += other[key]
+
+    def add_avg(self, other, key, denom):
+        self[key] = (other[key] * other[denom] + self[key] * self[denom]) / (self[denom] + other[denom])
+
+
 class TrackedItem(object):
     def __init__(self):
         self.name = ''
-        self.views = 0.0
-        self.unique = 0.0
-        self.avg_time = 0.0
-        self.time = 0.0
+        self.parent = None
+        self.data = DataStore(float)
         self.leaf = False
         self.node = Tree()
 
-    def update_stats(self, name, parent_node, views, unique, time, avg_time, sf):
-        self.avg_time = avg_time * views + self.avg_time * self.views
-        self.views += views
-        self.avg_time /= self.views
-        self.unique += unique
-        self.time += time
+    @property
+    def root(self):
+        return self.parent.root if self.parent else self
+
+    def update_stats(self, name, parent, data, sf):
+        self.data.merge(data)
         self.name = self.node.name = name
-        if parent_node and self.node not in parent_node.children:
-            parent_node.add_child(self.node)
-        self.node.add_feature("weight", getattr(self, sf))
-        self.node.add_feature("views", self.views)
-        self.node.add_feature("unique", self.unique)
-        self.node.add_feature("time", self.time)
-        self.node.add_feature("avg_time", self.avg_time)
         self.node.item = self
+        if parent and self.node not in parent.node.children:
+            self.parent = parent
+            parent.node.add_child(self.node)
+
+        self.node.add_feature("weight", self.data[sf])
+        for key in self.data:
+            self.node.add_feature(key, self.data[key])
 
     def __str__(self):
-        return "%s: %d views, %d unique, %ds time, %ds average time" % (self.name, self.views, self.unique, self.time, self.avg_time)
+        return "%s: %s" % (self.name, ','.join(["%d %s" % (self.data[key], key) for key in self.data]))
 
 class Path(TrackedItem):
     def __init__(self):
         super(Path, self).__init__()
-        self.parent = None
         self.children = defaultdict(Path)
         self.parameters = defaultdict(Parameter)
 
@@ -59,7 +75,7 @@ class Path(TrackedItem):
         return "%s/%s" % (self.parent.full_path() if self.parent else '', super(Path, self).__str__())
 
     def print_data(self, depth=0, tab_size=4, sort_field='views', reverse=True):
-        sort_function = lambda x: getattr(x, sort_field)
+        sort_function = lambda x: x.data[sort_field]
         tab = ' ' * tab_size
         print "%s%s" % (tab * depth, self)
         if self.parameters:
@@ -71,24 +87,23 @@ class Path(TrackedItem):
         for child in sorted(self.children.values(), key=sort_function, reverse=reverse):
             child.print_data(depth + 1, tab_size, sort_field)
 
-    def traverse(self, paths, parameters, views, unique, time, avg_time, sf):
+    def traverse(self, paths, parameters, data, sf):
         if len(paths) > 0:
             path = self.children[paths[0]]
-            path.parent = self
-            path.update_stats(paths[0], self.node, views, unique, time, avg_time, sf)
-            path.traverse(paths[1:], parameters, views, unique, time, avg_time, sf)
+            path.update_stats(paths[0], self, data, sf)
+            path.traverse(paths[1:], parameters, data, sf)
         elif parameters:
             for key, val in parameters:
                 parameter = self.parameters[key]
-                parameter.update_stats(key, self.node, views, unique, time, avg_time, sf)
+                parameter.update_stats(key, self, data, sf)
                 value = parameter.values[val]
-                value.update_stats(val, parameter.node, views, unique, time, avg_time, sf)
+                value.update_stats(val, parameter, data, sf)
         #if self.name == 'acacia_technologies':
         #    ipdb.set_trace()
         if len(paths) is 0 or paths[0] == '':
             self.leaf = True
 
-    def update(self, path, views, unique, time, avg_time, sf):
+    def update(self, path, data, sf):
         if path.startswith('/'):
             if '?' in path:
                 path, param_string = path.split('?', 1)
@@ -97,18 +112,29 @@ class Path(TrackedItem):
             else: 
                 parameters = []
             paths = path.split('/')[1:]
-            self.update_stats('', None, views, unique, time, avg_time, sf)
-            self.traverse(paths, parameters, views, unique, time, avg_time, sf)
+            self.update_stats('', None, data, sf)
+            self.traverse(paths, parameters, data, sf)
 
 class Parameter(TrackedItem):
     def __init__(self):
         super(Parameter, self).__init__()
         self.values = defaultdict(Value)
 
+    def full_path(self):
+        return "%s?%s" % (self.parent.full_path(), self.name)
+
+    def __str__(self):
+        return "%s?%s" % (self.parent.full_path(), super(Parameter, self).__str__())
+
 class Value(TrackedItem):
     def __init__(self):
         super(Value, self).__init__()
 
+    def full_path(self):
+        return "%s=%s" % (self.parent.full_path(), self.name)
+
+    def __str__(self):
+        return "%s=%s" % (self.parent.full_path(), super(Value, self).__str__())
 
 
 # convert an "HH:MM:SS" string to an integer representing the total number of seconds
@@ -125,11 +151,18 @@ with open(options.file, 'r') as f:
         url = re.sub(r'^/https?://[\w\.]+/', '/', url)
         if search and not re.match(search, url):
             continue
-        views = int(row['Pageviews'].replace(',', ''))
-        unique = int(row['Unique Pageviews'].replace(',', ''))
-        avg_time = to_seconds(row['Avg. Time on Page'])
-        time = views * avg_time
-        root.update(url, views, unique, time, avg_time, options.field)
+        data = DataStore()
+        if 'Pageviews' in row:
+            data['views'] = int(row['Pageviews'].replace(',', ''))
+        if 'Unique Pageviews' in row:
+            data['unique'] = int(row['Unique Pageviews'].replace(',', ''))
+        if 'Page Load Sample' in row:
+            data['load_sample'] = int(row['Page Load Sample'].replace(',', ''))
+        if 'Avg. Time on Page' in row:
+            data['avg_time'] = to_seconds(row['Avg. Time on Page'])
+        if 'Avg. Page Load Time (sec)' in row:
+            data['avg_load'] = float(row['Avg. Page Load Time (sec)'])
+        root.update(url, data, options.field)
 
 
 
